@@ -34,6 +34,38 @@ type board struct {
 	mu     sync.Mutex
 	nextID int
 	cards  []card
+	subs   map[chan struct{}]struct{}
+}
+
+// subscribe registriert einen Client für Änderungsmeldungen.
+func (b *board) subscribe() chan struct{} {
+	ch := make(chan struct{}, 1)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.subs == nil {
+		b.subs = make(map[chan struct{}]struct{})
+	}
+	b.subs[ch] = struct{}{}
+	return ch
+}
+
+func (b *board) unsubscribe(ch chan struct{}) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.subs, ch)
+}
+
+// notify informiert alle Clients. Nicht blockierend: Mehrfachmeldungen werden zusammengefasst.
+// Muss ohne gehaltenen Lock aufgerufen werden.
+func (b *board) notify() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for ch := range b.subs {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
 }
 
 func validCol(c string) bool {
@@ -47,9 +79,10 @@ func validCol(c string) bool {
 
 func (b *board) add(title string) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	b.nextID++
 	b.cards = append(b.cards, card{ID: b.nextID, Title: title, Col: columns[0]})
+	b.mu.Unlock()
+	b.notify()
 }
 
 func (b *board) move(id int, col string) bool {
@@ -57,25 +90,29 @@ func (b *board) move(id int, col string) bool {
 		return false
 	}
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	for i := range b.cards {
 		if b.cards[i].ID == id {
 			b.cards[i].Col = col
+			b.mu.Unlock()
+			b.notify()
 			return true
 		}
 	}
+	b.mu.Unlock()
 	return false
 }
 
 func (b *board) remove(id int) bool {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	for i := range b.cards {
 		if b.cards[i].ID == id {
 			b.cards = append(b.cards[:i], b.cards[i+1:]...)
+			b.mu.Unlock()
+			b.notify()
 			return true
 		}
 	}
+	b.mu.Unlock()
 	return false
 }
 
@@ -170,6 +207,34 @@ func main() {
 		render(w, b.view())
 	})
 
+	// Server-Sent Events: meldet jede Änderung an alle offenen Tabs.
+	mux.HandleFunc("GET /events", func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "Streaming nicht unterstützt", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+
+		ch := b.subscribe()
+		defer b.unsubscribe(ch)
+
+		_, _ = w.Write([]byte(": verbunden\n\n"))
+		flusher.Flush()
+
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-ch:
+				_, _ = w.Write([]byte("event: change\ndata: 1\n\n"))
+				flusher.Flush()
+			}
+		}
+	})
+
 	mux.HandleFunc("POST /cards", func(w http.ResponseWriter, r *http.Request) {
 		title := strings.TrimSpace(r.FormValue("title"))
 		if title == "" || len(title) > maxTitle {
@@ -256,6 +321,12 @@ const indexPage = `<!doctype html>
   <div id="board" hx-get="/board" hx-trigger="load" hx-swap="outerHTML"></div>
 
   <script>
+    // Live-Updates: bei jeder Änderung auf dem Server das Board neu laden.
+    const events = new EventSource('/events');
+    events.addEventListener('change', () => {
+      htmx.ajax('GET', '/board', { target: '#board', swap: 'outerHTML' });
+    });
+
     // Drag-and-drop: setzt die Ziel-Spalte per htmx-Request.
     function dropCard(event, col, el) {
       event.preventDefault();
